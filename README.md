@@ -135,17 +135,16 @@ class GPT3Config:
         self.epochs = 5                        # Number of epochs to train
 ```
 
-=========================================================================================
-=========================================================================================
 ## Experiment Note
-
+=========================================================================================
+======================================================================
 I was running the experiments on **Google Colab with an A100 GPU**,  
-but due to **limited computing units**, I was unable to provide the results at this time.  
+but due to **limited computing units**, I was unable to provide the results at this time.
 
-I plan to **re-run the experiments in the future** when units are available,  
-and will update this repository with the **verification results** accordingly.  
+I plan to **re-run the experiments in the future** when units are available,
+and will update this repository with the **verification results** accordingly.
 =========================================================================================
-=========================================================================================
+================================================================================
 
 # Additional Insights
 
