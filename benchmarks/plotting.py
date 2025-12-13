@@ -157,11 +157,19 @@ def plot_forward_figure(
         {"head_dim": 256, "causal": False},
         {"head_dim": 256, "causal": True},
     ]
+    panel_captions = [
+        "(a) Forward, without causal mask, head dim 64",
+        "(b) Forward, with causal mask, head dim 64",
+        "(c) Forward, without causal mask, head dim 128",
+        "(d) Forward, with causal mask, head dim 128",
+        "(e) Forward, without causal mask, head dim 256",
+        "(f) Forward, with causal mask, head dim 256",
+    ]
 
     fig, axes = plt.subplots(3, 2, figsize=(12, 10), sharey=False)
     legend_handles: Dict[str, any] = {}
 
-    for ax, panel in zip(itertools.chain.from_iterable(axes), panels):
+    for idx, (ax, panel) in enumerate(zip(itertools.chain.from_iterable(axes), panels)):
         x_labels, values, statuses = _panel_values(
             records,
             direction="forward",
@@ -179,15 +187,17 @@ def plot_forward_figure(
             title=f"Attention forward speed, head dim {panel['head_dim']} (H100 80GB SXM5)",
             show_legend=not legend_handles,
         )
+        ax.set_xlabel(panel_captions[idx], fontsize=9)
+        ax.xaxis.set_label_coords(0.5, -0.2)
         for name, handle in handles:
             if handle is not None and name not in legend_handles:
                 legend_handles[name] = handle
 
-    fig.tight_layout(rect=[0, 0.03, 1, 0.98])
+    fig.tight_layout(rect=[0, 0.08, 1, 0.98])
     if legend_handles:
         fig.legend(legend_handles.values(), legend_handles.keys(), loc="upper center", ncol=len(legend_handles))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=200)
+    fig.savefig(output_path, dpi=300)
     plt.close(fig)
 
 
@@ -201,10 +211,34 @@ def plot_mixed_figure(
     caption: str,
 ) -> None:
     panels = [
-        {"direction": "backward", "head_dim": 64, "causal": False, "title": "Backward, head dim 64"},
-        {"direction": "backward", "head_dim": 128, "causal": False, "title": "Backward, head dim 128"},
-        {"direction": "forward", "head_dim": 256, "causal": False, "title": "Forward, head dim 256"},
-        {"direction": "forward", "head_dim": 256, "causal": True, "title": "Forward causal, head dim 256"},
+        {
+            "direction": "backward",
+            "head_dim": 64,
+            "causal": False,
+            "title": "Attention backward speed, head dim 64 (H100 80GB SXM5)",
+            "caption": "(a) Backward, without causal mask, head dim 64",
+        },
+        {
+            "direction": "backward",
+            "head_dim": 128,
+            "causal": False,
+            "title": "Attention backward speed, head dim 128 (H100 80GB SXM5)",
+            "caption": "(b) Backward, without causal mask, head dim 128",
+        },
+        {
+            "direction": "forward",
+            "head_dim": 256,
+            "causal": False,
+            "title": "Attention forward speed, head dim 256 (H100 80GB SXM5)",
+            "caption": "(a) Forward, without causal mask, head dim 256",
+        },
+        {
+            "direction": "forward",
+            "head_dim": 256,
+            "causal": True,
+            "title": "Attention forward speed, head dim 256 (H100 80GB SXM5)",
+            "caption": "(b) Forward, with causal mask, head dim 256",
+        },
     ]
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 7), sharey=False)
@@ -225,19 +259,21 @@ def plot_mixed_figure(
             x_labels,
             values,
             statuses,
-            title=f"{panel['title']} (H100 80GB SXM5)",
+            title=panel["title"],
             show_legend=not legend_handles,
         )
+        ax.set_xlabel(panel["caption"], fontsize=9)
+        ax.xaxis.set_label_coords(0.5, -0.18)
         for name, handle in handles:
             if handle is not None and name not in legend_handles:
                 legend_handles[name] = handle
 
-    fig.tight_layout(rect=[0, 0.05, 1, 0.94])
+    fig.tight_layout(rect=[0, 0.1, 1, 0.92])
     if legend_handles:
         fig.legend(legend_handles.values(), legend_handles.keys(), loc="upper center", ncol=len(legend_handles))
-    fig.text(0.5, 0.01, caption, ha="center", fontsize=11)
+    fig.text(0.5, 0.52, caption, ha="center", fontsize=11)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=200)
+    fig.savefig(output_path, dpi=300)
     plt.close(fig)
 
 
@@ -249,30 +285,40 @@ def render_ablation_table(
     latex_path: Optional[Path] = None,
     config: Optional[str] = None,
 ) -> None:
-    grouped: Dict[str, List[BenchmarkRecord]] = {}
+    filtered: List[BenchmarkRecord] = []
     for rec in records:
         if rec.status != "ok":
             continue
         if config and rec.config != config:
             continue
-        label = rec.config or rec.method
-        grouped.setdefault(label, []).append(rec)
+        filtered.append(rec)
 
-    rows: List[Tuple[str, float, float]] = []
-    for label, recs in grouped.items():
-        latencies = [r.mean_ms for r in recs if r.mean_ms is not None]
-        speeds = [r.tflops for r in recs if r.tflops is not None]
+    targets: List[Tuple[str, Any]] = [
+        ("FLASHATTENTION-3", lambda r: r.algo == "fa3"),
+        ("No GEMM-Softmax Pipelining, Warp-Specialization", lambda r: r.algo == "fa2"),
+        ("GEMM-Softmax Pipelining, No Warp-Specialization", lambda r: r.algo == "fa1"),
+    ]
+
+    def summarize(label: str, predicate) -> Tuple[str, Optional[float], Optional[float]]:
+        matches = [r for r in filtered if (r.config == label or predicate(r))]
+        latencies = [r.mean_ms for r in matches if r.mean_ms is not None]
+        speeds = [r.tflops for r in matches if r.tflops is not None]
         if not latencies or not speeds:
-            continue
-        rows.append((label, statistics.mean(latencies), statistics.mean(speeds)))
+            return label, None, None
+        return label, statistics.mean(latencies), statistics.mean(speeds)
 
-    rows.sort(key=lambda r: r[0])
-    if not rows:
-        return
+    rows: List[Tuple[str, Optional[float], Optional[float]]] = [summarize(label, pred) for label, pred in targets]
 
     fig, ax = plt.subplots(figsize=(6, 0.6 * (len(rows) + 2)))
     ax.axis("off")
-    cell_text = [[name, f"{latency:.2f} ms", f"{tflops:.2f}"] for name, latency, tflops in rows]
+    cell_text = [
+        [
+            name,
+            f"{latency:.3f} ms" if latency is not None else "-",
+            f"{tflops:.3f}" if tflops is not None else "-",
+        ]
+        for name, latency, tflops in rows
+    ]
     table = ax.table(
         cellText=cell_text,
         colLabels=["Configuration", "Time", "TFLOPs/s"],
@@ -280,6 +326,7 @@ def render_ablation_table(
         colColours=["#f0f0f0", "#f0f0f0", "#f0f0f0"],
         loc="center",
     )
+    ax.set_title("Table 2: Pipelining ablation measurements", pad=12, fontsize=12, weight="bold")
     table.auto_set_font_size(False)
     table.set_fontsize(10)
     for key, cell in table.get_celld().items():
@@ -287,7 +334,7 @@ def render_ablation_table(
             cell.set_text_props(weight="bold")
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     if markdown_path:
@@ -296,7 +343,9 @@ def render_ablation_table(
             f.write("| Configuration | Time (ms) | TFLOPs/s |\n")
             f.write("|---|---|---|\n")
             for name, latency, tflops in rows:
-                f.write(f"| {name} | {latency:.2f} | {tflops:.2f} |\n")
+                latency_str = f"{latency:.3f}" if latency is not None else "-"
+                tflops_str = f"{tflops:.3f}" if tflops is not None else "-"
+                f.write(f"| {name} | {latency_str} | {tflops_str} |\n")
 
     if latex_path:
         latex_path.parent.mkdir(parents=True, exist_ok=True)
@@ -304,7 +353,9 @@ def render_ablation_table(
             f.write("\\begin{tabular}{lcc}\n")
             f.write("\\textbf{Configuration} & \\textbf{Time (ms)} & \\textbf{TFLOPs/s}\\\\\\hline\n")
             for name, latency, tflops in rows:
-                f.write(f"{name} & {latency:.2f} & {tflops:.2f}\\\\\n")
+                latency_str = f"{latency:.3f}" if latency is not None else "-"
+                tflops_str = f"{tflops:.3f}" if tflops is not None else "-"
+                f.write(f"{name} & {latency_str} & {tflops_str}\\\\\n")
             f.write("\\end{tabular}\n")
 
 
