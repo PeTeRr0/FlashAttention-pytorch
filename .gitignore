@@ -205,3 +205,37 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Platform/editor noise
+.DS_Store
+.AppleDouble
+.LSOverride
+.idea/
+.vscode/
+
+# Build / binary artifacts
+*.dylib
+*.pyd
+*.dll
+*.cubin
+*.ptx
+*.o
+*.obj
+build*/
+csrc/build/
+cmake-build-*/
+
+# Experiment / runtime outputs
+logs/
+wandb/
+lightning_logs/
+tensorboard/
+*.ckpt
+*.pth
+*.pt
+*.bin
+
+# Local config
+.python-version
+*.env
+pip-wheel-metadata/
