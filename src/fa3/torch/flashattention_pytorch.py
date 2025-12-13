@@ -1,5 +1,4 @@
-#@title FlashAttention GPT-3
-
+# FlashAttention PyTorch module extracted from the notebook
 import torch
 from torch import nn
 import math
@@ -15,7 +14,6 @@ from torch import optim
 from tqdm import tqdm
 from torch import amp
 from torch.cuda.amp import autocast, GradScaler
-import matplotlib.pyplot as plt
 
 class MultiHeadAttention(nn.Module):
   def __init__(self, d_model, num_heads, dropout, use_fused_qkv=True, block_size=128):
@@ -675,3 +673,291 @@ class Transformer(nn.Module):
 
         logits = self.fc_out(x)                  # (B, L, vocab_size)
         return logits
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class FlashAttentionConfig:
+    def __init__(self):
+        # Model architecture
+        self.vocab_size = 50257     # Size of tokenizer vocabulary
+        self.d_model = 768          # Model hidden dimension (e.g., 12288 for larger models)
+        self.n_layers = 12          # Number of Transformer decoder layers (e.g., 96 for larger models)
+        self.n_heads = 12           # Number of attention heads per layer (e.g., 96 for larger models)
+        self.d_ff = 3072            # Feed-forward network hidden dimension (e.g., 49152 for larger models)
+        self.dropout = 0.1          # Dropout rate (set to 0.0 to disable)
+        self.max_seq_len = 512      # Maximum sequence length
+
+        # Optimization / hyperparameters
+        self.lr = 1e-4              # Learning rate for Adam optimizer
+        self.betas = (0.9, 0.95)    # Beta values for Adam optimizer
+        self.eps = 1e-8             # Epsilon for numerical stability in Adam optimizer
+        self.weight_decay = 0.0     # Weight decay for regularization
+        self.warmup_steps = 1000    # Number of steps to linearly warm up the LR
+        self.lr_decay = "cosine"    # Learning rate decay schedule after warmup
+
+        # FlashAttention / blocking
+        self.block_size = 128             # Block size used by block-sparse
+        self.use_flash_attention = True   # Flag to enable FlashAttention
+
+        # Model details
+        self.activation = "gelu"          # Activation function used in feed-forward layers
+        self.initializer_range = 0.02     # Stddev for weight initialization
+
+        # A100 optimization setup
+        self.gradient_accumulation_steps = 16  # Large batch simulation
+        self.mixed_precision = True            # FP16/BF16
+        self.compile_model = True              # torch.compile
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'  # Automatically select GPU if available, else use CPU
+        self.epochs = 5                        # Number of epochs to train
+
+
+class FlashAttentionDataset(Dataset):
+    def __init__(self, texts, tokenizer, max_seq_len, vocab_size=None, sequential=True):
+        """
+        Args:
+            texts (list[str]): Raw text samples
+            tokenizer: tokenizer (e.g., tiktoken)
+            max_seq_len (int): Max sequence length
+            vocab_size (int, optional): Limit vocab to config size
+            sequential (bool):
+                - True: sequential slicing of tokens (deterministic)
+                - False: random subsequence sampling (better generalization)
+        """
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+        self.vocab_size = vocab_size
+        self.sequential = sequential
+
+        # Tokenize all texts once into one long stream
+        print("Tokenizing dataset...")
+        start_time = time.time()
+
+        self.tokens = []
+        for i, text in enumerate(texts):
+            # encode returns list[int] token ids
+            token_ids = tokenizer.encode(text)
+            self.tokens.extend(token_ids)
+
+            # Progress logging every 10k texts helps estimate runtime on large corpora
+            if (i + 1) % 10000 == 0:
+                elapsed = (time.time() - start_time) / 60
+                progress = (i + 1) / len(texts) * 100
+                print(f"Progress: {i+1:,}/{len(texts):,} ({progress:.1f}%) - Elapsed: {elapsed:.1f}min")
+
+        # Tokenization completed
+        total_time = (time.time() - start_time) / 60
+        print(f"Tokenization completed in {total_time:.1f} minutes")
+
+        # store stats used by __len__ and __getitem__
+        self.total_tokens = len(self.tokens)
+        # Number of full sequences
+        self.num_sequences = self.total_tokens // self.max_seq_len
+        print(f"Total tokens: {self.total_tokens:,}")
+        print(f"Total usable sequences: {self.num_sequences:,}")
+
+    def __len__(self):
+        return self.num_sequences
+
+    def __getitem__(self, idx):
+        # Determine start index for the requested sequence
+        if self.sequential:
+            start = idx * self.max_seq_len
+        else:
+            # random offset for more variety
+            start = random.randint(0, self.total_tokens - self.max_seq_len - 1)
+
+        end = start + self.max_seq_len
+        seq = self.tokens[start:end]
+
+        # Ensure fixed length by padding with 0's
+        if len(seq) < self.max_seq_len:
+            seq += [0] * (self.max_seq_len - len(seq))
+
+        # Clamp IDs to vocab_size
+        seq = [min(t, self.vocab_size - 1) for t in seq]
+
+        # Inputs are tokens[:-1], targets are tokens[1:] (next-token prediction)
+        input_ids = torch.tensor(seq[:-1], dtype=torch.long)
+        target_ids = torch.tensor(seq[1:], dtype=torch.long)
+        return input_ids, target_ids
+
+
+if __name__ == "__main__":
+    config = FlashAttentionConfig()
+    # --- Load dataset (OpenWebText) ---
+    dataset_owt = load_dataset("openwebtext", split="train[:5%]")
+    texts = dataset_owt['text'][:1_500_000]  # sampling (≈300M target tokens)
+
+    print(f"Total raw texts loaded: {len(texts):,}")
+
+    # --- GPT-3 tokenizer ---
+    tokenizer = tiktoken.get_encoding("cl100k_base")  # GPT-3 BPE tokenizer
+    print(f"Tokenizer vocab size: {tokenizer.n_vocab:,}")
+
+    # Update config vocab_size
+    config.vocab_size = tokenizer.n_vocab
+    print(f"Updated config vocab_size to: {config.vocab_size:,}")
+
+    # --- Dataset & DataLoader ---
+    max_seq_len = 256  # adjust based on GPU memory
+    train_dataset = FlashAttentionDataset(
+        texts, tokenizer, max_seq_len=max_seq_len,  # keep tokenizer's vocab by default
+        vocab_size=config.vocab_size, sequential=False  # False → random subsequences
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=16,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
+
+    # Debug check
+    sample_in, sample_out = train_dataset[0]
+    print(f"Sample input shape: {sample_in.shape}, dtype={sample_in.dtype}")
+    print(f"Sample target shape: {sample_out.shape}, dtype={sample_out.dtype}")
+
+    # Enables cuDNN autotuner to find the best algorithm for the hardware (improves training speed)
+    torch.backends.cudnn.benchmark = True
+
+    # Initialize Transformer model
+    model = Transformer(
+        vocab_size=config.vocab_size,
+        d_model=config.d_model,
+        num_heads=config.n_heads,
+        num_layers=config.n_layers,
+        d_ff=config.d_ff,
+        dropout=config.dropout,
+        max_len=max_seq_len
+    ).to(config.device)
+
+    # Compile model if requested
+    if getattr(config, "compile_model", False):
+        try:
+            model = torch.compile(model, backend="inductor")
+        except Exception as e:
+            print("[WARN] torch.compile failed or incompatible:", e)
+
+    # Mixed precision scaler
+    scaler = torch.cuda.amp.GradScaler(enabled=bool(getattr(config, "mixed_precision", True)))
+
+    # Optimizer & Scheduler
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config.lr,
+        betas=config.betas,
+        eps=config.eps,
+        weight_decay=config.weight_decay
+    )
+
+    # Gradient accumulation & steps
+    grad_accum_steps = max(1, getattr(config, "gradient_accumulation_steps", 1))
+    steps_per_epoch = len(train_loader) // grad_accum_steps
+    # Total number of optimization steps across all epochs
+    total_steps = steps_per_epoch * config.epochs if steps_per_epoch > 0 else len(train_loader) * config.epochs
+
+    # CosineAnnealingLR learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_steps))
+
+    # Stats
+    flash_stats = {'time_per_batch': [], 'peak_memory_mb': []}
+    log_interval = 20
+
+    # --- Training loop ---
+    model.train()
+    for epoch in range(config.epochs):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(device=config.device)
+
+        total_loss = 0.0
+        optimizer.zero_grad(set_to_none=True)   # Reset gradients efficiently
+
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                    desc=f"Epoch {epoch+1}/{config.epochs}", leave=True)
+
+        for batch_idx, (input_ids, target_ids) in pbar:
+            # move to GPU efficiently
+            input_ids = input_ids.to(config.device, non_blocking=True)
+            target_ids = target_ids.to(config.device, non_blocking=True)
+
+            # timing
+            if torch.cuda.is_available():
+                start_evt = torch.cuda.Event(enable_timing=True)
+                end_evt = torch.cuda.Event(enable_timing=True)
+                start_evt.record()
+            else:
+                start_time = time.time()
+
+            # forward + mixed precision
+            with torch.cuda.amp.autocast(enabled=config.mixed_precision):
+                logits = model(input_ids) # Forward pass
+                loss = criterion(logits.view(-1, config.vocab_size), target_ids.view(-1))
+                loss = loss / grad_accum_steps  # Scale loss for gradient accumulation
+
+            # backward with scaling
+            scaler.scale(loss).backward()
+
+            # optimizer step with gradient accumulation
+            if ((batch_idx + 1) % grad_accum_steps == 0) or (batch_idx + 1 == len(train_loader)):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), getattr(config, 'max_grad_norm', 1.0))
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                try:
+                    scheduler.step()  # Update learning rate
+                except Exception:
+                    pass
+
+            # timing measurement
+            if torch.cuda.is_available():
+                end_evt.record()
+                torch.cuda.synchronize()
+                batch_time = start_evt.elapsed_time(end_evt) / 1000.0   # Convert ms to seconds
+                peak_memory = torch.cuda.max_memory_allocated(device=config.device) / 1024**2   # MB
+            else:
+                batch_time = time.time() - start_time
+                peak_memory = 0.0
+
+            # Save stats
+            flash_stats['time_per_batch'].append(batch_time)
+            flash_stats['peak_memory_mb'].append(peak_memory)
+
+            # Update loss tracking
+            total_loss += loss.item() * grad_accum_steps
+            avg_loss = total_loss / (batch_idx + 1)
+
+            # log periodically
+            if (batch_idx % log_interval == 0) or (batch_idx + 1 == len(train_loader)):
+                try:
+                    current_lr = scheduler.get_last_lr()[0]
+                except Exception:
+                    current_lr = optimizer.param_groups[0]['lr']
+                pbar.set_postfix({
+                    'loss': f"{avg_loss:.4f}",
+                    'lr': f"{current_lr:.3e}",
+                    'time(s)': f"{batch_time:.4f}",
+                    'peak_mem(MB)': f"{peak_memory:.1f}"
+                })
+
+        # epoch cleanup
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.save(model.state_dict(), f"flashattn_epoch{epoch+1}.pt")
+        print(f"Epoch {epoch+1} done. Avg loss: {avg_loss:.4f}, checkpoint saved.")
+
+    # --- final stats ---
+    if flash_stats['time_per_batch']:
+        avg_time = sum(flash_stats['time_per_batch']) / len(flash_stats['time_per_batch'])
+        avg_mem = sum(flash_stats['peak_memory_mb']) / len(flash_stats['peak_memory_mb'])
+    else:
+        avg_time, avg_mem = 0.0, 0.0
+
+    print(f"--- Training Summary ---")
+    print(f"Average batch time: {avg_time:.6f} sec")
+    print(f"Average peak memory: {avg_mem:.2f} MB")
+    print("Training complete.")
