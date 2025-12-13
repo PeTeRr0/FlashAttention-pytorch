@@ -1,17 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
+import math
 import statistics
 import sys
 import time
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
+FIGURES_DIR = Path(__file__).resolve().parent / "figures"
+TABLES_DIR = Path(__file__).resolve().parent / "tables"
+for _d in (RESULTS_DIR, FIGURES_DIR, TABLES_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
 
 try:
     import torch
@@ -95,7 +106,9 @@ def benchmark_fn(
     """Benchmark callable returning a tensor. Returns (mean_ms, std_ms, peak_mem_mb)."""
     if device == "cuda":
         torch.cuda.synchronize()
-    with torch.inference_mode():
+    use_grad = getattr(fn, "_requires_grad", False)
+    context = nullcontext if use_grad else torch.inference_mode
+    with context():
         for _ in range(warmup):
             out = fn()
             if torch.is_tensor(out):
@@ -145,6 +158,77 @@ def maybe_cast_dtype(dtype: str) -> Optional[torch.dtype]:
     return mapping.get(dtype.lower(), None)
 
 
+@dataclass
+class BenchmarkRecord:
+    method: str
+    algo: str
+    backend: str
+    direction: str
+    dtype: str
+    causal: bool
+    seqlen: int
+    head_dim: int
+    batch_size: int
+    num_heads: int
+    mean_ms: Optional[float]
+    std_ms: Optional[float]
+    tflops: Optional[float]
+    peak_mem_mb: Optional[float]
+    status: str
+    fp8: Optional[bool] = None
+    config: Optional[str] = None
+    error: Optional[str] = None
+
+    def label(self) -> str:
+        pieces = [self.method]
+        if self.fp8 is True:
+            pieces.append("fp8")
+        if self.config:
+            pieces.append(self.config)
+        return " / ".join(pieces)
+
+    def to_row(self) -> List[str]:
+        return [
+            self.method,
+            self.backend,
+            self.direction,
+            self.dtype,
+            f"B{self.batch_size} H{self.num_heads} N{self.seqlen} D{self.head_dim}",
+            "causal" if self.causal else "non-causal",
+            f"{self.mean_ms:.2f}" if self.mean_ms is not None else "-",
+            f"{self.std_ms:.2f}" if self.std_ms is not None else "-",
+            f"{self.tflops:.2f}" if self.tflops is not None else "-",
+            f"{self.peak_mem_mb:.1f}" if self.peak_mem_mb is not None else "-",
+            self.status if not self.error else f"{self.status} ({self.error})",
+        ]
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        return data
+
+
+def attention_flops(batch: int, heads: int, seqlen: int, head_dim: int, direction: str = "forward") -> float:
+    # Forward attention = 2 matmuls (qk^T and p*v) ~ 4 * B * H * N^2 * D FLOPs.
+    # Backward roughly doubles the forward compute, so we scale by 2 for backward.
+    forward_factor = 4.0
+    factor = forward_factor if direction == "forward" else forward_factor * 2.0
+    return factor * batch * heads * (seqlen**2) * head_dim
+
+
+def compute_tflops(
+    batch: int, heads: int, seqlen: int, head_dim: int, mean_ms: Optional[float], direction: str
+) -> Optional[float]:
+    if mean_ms is None or math.isnan(mean_ms):
+        return None
+    flops = attention_flops(batch, heads, seqlen, head_dim, direction)
+    return flops / (mean_ms / 1000.0) / 1e12
+
+
+def is_oom_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "out of memory" in text or isinstance(exc, torch.cuda.OutOfMemoryError)
+
+
 def format_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
     col_widths = [len(h) for h in headers]
     for row in rows:
@@ -162,8 +246,14 @@ def format_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device", default="cuda" if has_cuda() else "cpu", choices=["cpu", "cuda"])
-    parser.add_argument("--seqlen", type=int, nargs="+", default=[128, 512, 1024], help="Sequence lengths")
-    parser.add_argument("--head-dim", type=int, nargs="+", default=[64], help="Head dimensions")
+    parser.add_argument(
+        "--seqlen",
+        type=int,
+        nargs="+",
+        default=[512, 1024, 2048, 4096, 8192, 16384],
+        help="Sequence lengths",
+    )
+    parser.add_argument("--head-dim", type=int, nargs="+", default=[64, 128, 256], help="Head dimensions")
     parser.add_argument("--batch-size", type=int, nargs="+", default=[1, 2], help="Batch sizes")
     parser.add_argument("--num-heads", type=int, nargs="+", default=[4], help="Number of heads")
     parser.add_argument("--causal", action="store_true", help="Run only causal mode (defaults to both)")
@@ -192,3 +282,56 @@ def format_result_row(entry: Dict[str, Optional[str]]) -> List[str]:
         entry.get("mem", ""),
         entry.get("status", ""),
     ]
+
+
+def write_results(name: str, records: Sequence[BenchmarkRecord]) -> Dict[str, Path]:
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    safe_name = name.replace(" ", "_")
+    json_path = RESULTS_DIR / f"{safe_name}_{timestamp}.json"
+    csv_path = RESULTS_DIR / f"{safe_name}_{timestamp}.csv"
+
+    payload = [r.to_dict() for r in records]
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    fieldnames = [
+        "method",
+        "algo",
+        "backend",
+        "direction",
+        "dtype",
+        "causal",
+        "seqlen",
+        "head_dim",
+        "batch_size",
+        "num_heads",
+        "mean_ms",
+        "std_ms",
+        "tflops",
+        "peak_mem_mb",
+        "status",
+        "fp8",
+        "config",
+        "error",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            row = record.to_dict()
+            row["causal"] = bool(row["causal"])
+            writer.writerow(row)
+
+    return {"json": json_path, "csv": csv_path}
+
+
+def load_results(paths: Sequence[Path]) -> List[BenchmarkRecord]:
+    loaded: List[BenchmarkRecord] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        for row in data:
+            loaded.append(BenchmarkRecord(**row))
+    return loaded
