@@ -1,153 +1,95 @@
-import torch
 import triton
 import triton.language as tl
 
-
 @triton.jit
-def _flash_bwd_kernel(
-    Q, K, V, DO,
-    DQ, DK, DV,
-    M, N, H,
-    stride_qb, stride_qh, stride_ql, stride_qd,         # strides for Q
-    stride_kb, stride_kh, stride_kl, stride_kd,         # strides for K
-    stride_vb, stride_vh, stride_vl, stride_vd,         # strides for V
-    stride_dob, stride_doh, stride_dol, stride_dod,     # strides for DO
-    stride_dqb, stride_dqh, stride_dql, stride_dqd,     # strides for DQ
-    stride_dkb, stride_dkh, stride_dkl, stride_dkd,     # strides for DK
-    stride_dvb, stride_dvh, stride_dvl, stride_dvd,     # strides for DV
-    causal: tl.constexpr,
-    dropout_p: tl.constexpr,
-    softmax_scale: tl.constexpr,
-    softcap: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
+def fa3_bwd_d_kernel(
+    O, DO, D,
+    stride_om, stride_od, stride_dom, stride_dod, stride_dm, n_ctx,
+    d_head: tl.constexpr, BR: tl.constexpr
 ):
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
 
-    b = pid_bh // H
-    h = pid_bh % H
+    row_start = pid_m * BR
+    m_offsets = row_start + tl.arange(0, BR)
+    d_offsets = tl.arange(0, d_head)
 
-    m_start = pid_m * BLOCK_M
-    m_offsets = m_start + tl.arange(0, BLOCK_M)
-    d_offsets = tl.arange(0, BLOCK_DMODEL)
+    o_ptr = O + pid_bh * stride_om * n_ctx + m_offsets[:, None] * stride_om + d_offsets[None, :] * stride_od
+    do_ptr = DO + pid_bh * stride_dom * n_ctx + m_offsets[:, None] * stride_dom + d_offsets[None, :] * stride_dod
 
-    q_ptr = Q + b * stride_qb + h * stride_qh + m_start * stride_ql
-    k_ptr = K + b * stride_kb + h * stride_kh
-    v_ptr = V + b * stride_vb + h * stride_vh
-    do_ptr = DO + b * stride_dob + h * stride_doh + m_start * stride_dol
-    dq_ptr = DQ + b * stride_dqb + h * stride_dqh + m_start * stride_dql
-    dk_ptr = DK + b * stride_dkb + h * stride_dkh
-    dv_ptr = DV + b * stride_dvb + h * stride_dvh
+    o = tl.load(o_ptr, mask=(m_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head), other=0.0).to(tl.float32)
+    do = tl.load(do_ptr, mask=(m_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head), other=0.0).to(tl.float32)
 
-    q = tl.load(
-        q_ptr + m_offsets[:, None] * stride_ql + d_offsets[None, :] * stride_qd,
-        mask=(m_offsets[:, None] < M) & (d_offsets[None, :] < BLOCK_DMODEL),
-        other=0.0,
-    )
-    do = tl.load(
-        do_ptr + m_offsets[:, None] * stride_dol + d_offsets[None, :] * stride_dod,
-        mask=(m_offsets[:, None] < M) & (d_offsets[None, :] < BLOCK_DMODEL),
-        other=0.0,
-    )
+    dvec = tl.sum(o * do, axis=1)
 
-    dq_acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=tl.float32)
+    d_ptr = D + pid_bh * stride_dm * n_ctx + m_offsets * stride_dm
+    tl.store(d_ptr, dvec, mask=(m_offsets < n_ctx))
 
-    num_blocks = (N + BLOCK_N - 1) // BLOCK_N
-    last_start = (num_blocks - 1) * BLOCK_N
+@triton.jit
+def fa3_bwd_dk_dv_kernel(
+    Q, K, V, O,
+    DO, LSE, D, DQ, DK, DV,
+    stride_qm, stride_qd, stride_km, stride_kd,
+    stride_vm, stride_vd, stride_om, stride_od,
+    stride_dom, stride_dod, stride_lm, stride_dm,
+    stride_dqm, stride_dqd, stride_dkm, stride_dkd,
+    stride_dvm, stride_dvd, n_ctx, softmax_scale,
+    d_head: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr, CAUSAL: tl.constexpr
+):
+    pid_bh = tl.program_id(0)
+    pid_m = tl.program_id(1)
 
-    for block_idx in range(0, num_blocks):
-        n_start = last_start - block_idx * BLOCK_N
-        n_offsets = n_start + tl.arange(0, BLOCK_N)
+    col_start = pid_m * BC
+    n_offsets = col_start + tl.arange(0, BC)
+    d_offsets = tl.arange(0, d_head)
 
-        k_block = tl.load(
-            k_ptr + n_offsets[:, None] * stride_kl + d_offsets[None, :] * stride_kd,
-            mask=(n_offsets[:, None] < N) & (d_offsets[None, :] < BLOCK_DMODEL),
-            other=0.0,
-        )
-        v_block = tl.load(
-            v_ptr + n_offsets[:, None] * stride_vl + d_offsets[None, :] * stride_vd,
-            mask=(n_offsets[:, None] < N) & (d_offsets[None, :] < BLOCK_DMODEL),
-            other=0.0,
-        )
+    k_ptr = K + pid_bh * stride_km * n_ctx + n_offsets[:, None] * stride_km + d_offsets[None, :] * stride_kd
+    v_ptr = V + pid_bh * stride_vm * n_ctx + n_offsets[:, None] * stride_vm + d_offsets[None, :] * stride_vd
+    k = tl.load(k_ptr, mask=(n_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head), other=0.0).to(tl.float32)
+    v = tl.load(v_ptr, mask=(n_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head), other=0.0).to(tl.float32)
 
-        qk = tl.dot(q, tl.trans(k_block)) * softmax_scale
-        if softcap > 0:
-            qk = tl.minimum(qk, softcap)
-            qk = tl.maximum(qk, -softcap)
+    dk = tl.zeros((BC, d_head), dtype=tl.float32)
+    dv = tl.zeros((BC, d_head), dtype=tl.float32)
 
-        if causal:
-            q_idx = m_offsets[:, None]
-            k_idx = (n_start + tl.arange(0, BLOCK_N))[None, :]
-            qk = tl.where(k_idx > q_idx, float("-inf"), qk)
+    for pid_m in range(0, tl.cdiv(n_ctx, BR)):
+        row_start = pid_m * BR
+        if CAUSAL and (col_start >= row_start + BR):
+            continue
 
-        p = tl.softmax(qk, axis=1)
-        if dropout_p > 0.0:
-            keep = tl.rand(p.shape) >= dropout_p
-            p = p * keep / (1.0 - dropout_p)
+        m_offsets = row_start + tl.arange(0, BR)
 
-        dp = tl.dot(do, tl.trans(v_block))
-        delta = tl.sum(dp * p, axis=1)
-        dS = p * (dp - delta[:, None])
+        q_ptr = Q + pid_bh * stride_qm * n_ctx + m_offsets[:, None] * stride_qm + d_offsets[None, :] * stride_qd
+        do_ptr = DO + pid_bh * stride_dom * n_ctx + m_offsets[:, None] * stride_dom + d_offsets[None, :] * stride_dod
 
-        dq_acc += tl.dot(dS, k_block)
-        dk_block = tl.dot(tl.trans(dS), q)
-        dv_block = tl.dot(tl.trans(p), do)
+        q = tl.load(q_ptr, mask=(m_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head), other=0.0).to(tl.float32)
+        do = tl.load(do_ptr, mask=(m_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head), other=0.0).to(tl.float32)
 
-        tl.store(
-            dk_ptr + n_offsets[:, None] * stride_dkl + d_offsets[None, :] * stride_dkd,
-            dk_block,
-            mask=(n_offsets[:, None] < N) & (d_offsets[None, :] < BLOCK_DMODEL),
-        )
-        tl.store(
-            dv_ptr + n_offsets[:, None] * stride_dvl + d_offsets[None, :] * stride_dvd,
-            dv_block,
-            mask=(n_offsets[:, None] < N) & (d_offsets[None, :] < BLOCK_DMODEL),
-        )
+        lse_ptr = LSE + pid_bh * stride_lm * n_ctx + m_offsets * stride_lm
+        lse = tl.load(lse_ptr, mask=(m_offsets < n_ctx), other=0.0).to(tl.float32)
+        d_ptrs = D + pid_bh * stride_dm * n_ctx + m_offsets * stride_dm
+        dvec = tl.load(d_ptrs, mask=(m_offsets < n_ctx), other=0.0).to(tl.float32)
 
-    tl.store(
-        dq_ptr + m_offsets[:, None] * stride_dql + d_offsets[None, :] * stride_dqd,
-        dq_acc,
-        mask=(m_offsets[:, None] < M) & (d_offsets[None, :] < BLOCK_DMODEL),
-    )
+        scores = tl.dot(q, tl.trans(k)) * softmax_scale
 
-def flash_bwd(q, k, v, doutput, *, causal=False, dropout_p=0.0, softmax_scale=None, softcap=0.0):
-    b, h, m, dmodel = q.shape
-    n = k.shape[2]
+        if CAUSAL:
+            r = m_offsets[:, None]
+            c = n_offsets[None, :]
+            scores = tl.where(c > r, float("-inf"), scores)
 
-    if softmax_scale is None:
-        softmax_scale = dmodel ** -0.5
+        p = tl.exp(scores - lse[:, None])
 
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+        dv += tl.dot(tl.trans(p), do)
 
-    if dmodel <= 64:
-        block_m, block_n, block_dmodel = 64, 128, 64
-    else:
-        block_m, block_n, block_dmodel = 64, 64, min(128, dmodel)
+        dp = tl.dot(do, tl.trans(v))
+        ds = p * (dp - dvec[:, None])
 
-    grid = (b * h, triton.cdiv(m, block_m))
+        dq_update = tl.dot(ds, k) * softmax_scale
+        dq_ptr = DQ + pid_bh * stride_dqm * n_ctx + m_offsets[:, None] * stride_dqm + d_offsets[None, :] * stride_dqd
+        tl.atomic_add(dq_ptr, dq_update.to(tl.float16), mask=(m_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))
 
-    _flash_bwd_kernel[grid](
-        q, k, v, doutput,
-        dq, dk, dv,
-        m, n, h,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        doutput.stride(0), doutput.stride(1), doutput.stride(2), doutput.stride(3),
-        dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
-        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-        dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
-        causal,
-        dropout_p,
-        softmax_scale,
-        softcap,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_DMODEL=block_dmodel,
-    )
+        dk += tl.dot(tl.trans(ds), q) * softmax_scale
 
-    return dq, dk, dv
+    dk_ptr = DK + pid_bh * stride_dkm * n_ctx + n_offsets[:, None] * stride_dkm + d_offsets[None, :] * stride_dkd
+    dv_ptr = DV + pid_bh * stride_dvm * n_ctx + n_offsets[:, None] * stride_dvm + d_offsets[None, :] * stride_dvd
+    tl.store(dk_ptr, dk.to(tl.float16), mask=(n_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))
+    tl.store(dv_ptr, dv.to(tl.float16), mask=(n_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))

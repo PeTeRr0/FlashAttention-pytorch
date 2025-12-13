@@ -120,5 +120,5 @@ def fa2_torch(q, k, v, causal, softmax_scale, spec):
     qb = _merge_bh(q)
     kb = _merge_bh(k)
     vb = _merge_bh(v)
-    o, lse = forward(qb, kb, vb, causal, softmax_scale, spec.br, spec.bc)
+    o, lse = fa2_forward_torch(qb, kb, vb, causal, softmax_scale, spec.br, spec.bc)
     return o, lse

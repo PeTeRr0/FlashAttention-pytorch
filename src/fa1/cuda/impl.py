@@ -17,7 +17,7 @@ def _load_ext():
 
 def _merge_bh(x):
     if x.dim() == 3:
-        return x, None
+        return x
     b, h, n, d = x.shape
     return x.reshape(b * h, n, d), (b, h)
 

@@ -7,7 +7,8 @@ def fa1_fwd_kernel(
     stride_qm, stride_qd, stride_km, stride_kd,
     stride_vm, stride_vd, stride_om, stride_od,
     stride_lm, n_ctx, softmax_scale,
-    d_head: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr, CAUSAL: tl.constexpr
+    d_head: tl.constexpr, BR: tl.constexpr,
+    BC: tl.constexpr, CAUSAL: tl.constexpr
 ):
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -21,7 +22,7 @@ def fa1_fwd_kernel(
 
     m_i = tl.full((BR,), float("-inf"), dtype=tl.float32)
     l_i = tl.zeros((BR,), dtype=tl.float32)
-    acc = tl.zeros((BR, d_head), dtype=tl.float32)
+    o = tl.zeros((BR, d_head), dtype=tl.float32)
 
     for j in range(0, tl.cdiv(n_ctx, BC)):
         col_start = j * BC
@@ -29,7 +30,6 @@ def fa1_fwd_kernel(
             break
 
         n_offsets = col_start + tl.arange(0, BC)
-
         k_ptr = K + pid_bh * stride_km * n_ctx + n_offsets[:, None] * stride_km + d_offsets[None, :] * stride_kd
         v_ptr = V + pid_bh * stride_vm * n_ctx + n_offsets[:, None] * stride_vm + d_offsets[None, :] * stride_vd
 
@@ -43,22 +43,19 @@ def fa1_fwd_kernel(
             c = n_offsets[None, :]
             scores = tl.where(c > r, float("-inf"), scores)
 
-        rowmax = tl.max(scores, axis=1)
-        m_new = tl.maximum(m_i, rowmax)
-
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
         p = tl.exp(scores - m_new[:, None])
         l_new = tl.exp(m_i - m_new) * l_i + tl.sum(p, axis=1)
-
-        acc = tl.exp(m_i - m_new)[:, None] * acc + tl.dot(p, v)
+        o = tl.exp(m_i - m_new)[:, None] * o + tl.dot(p, v)
 
         m_i = m_new
         l_i = l_new
 
-    out = acc / l_i[:, None]
+    o = o / l_i[:, None]
     lse = m_i + tl.log(l_i)
 
     o_ptr = O + pid_bh * stride_om * n_ctx + m_offsets[:, None] * stride_om + d_offsets[None, :] * stride_od
-    tl.store(o_ptr, out.to(tl.float16), mask=(m_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))
+    tl.store(o_ptr, o.to(tl.float16), mask=(m_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))
 
     lse_ptr = LSE + pid_bh * stride_lm * n_ctx + m_offsets * stride_lm
     tl.store(lse_ptr, lse, mask=(m_offsets < n_ctx))

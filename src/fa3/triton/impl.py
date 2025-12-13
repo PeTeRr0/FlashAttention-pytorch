@@ -1,44 +1,32 @@
 import torch
+import triton
+from .kernels_fwd import fa3_fwd_kernel
 
-from .kernels_bwd import flash_bwd
-from .kernels_fwd import flash_fwd
+def _merge_bh(x):
+    if x.dim() == 3:
+        return x
+    b, h, n, d = x.shape
+    return x.reshape(b * h, n, d)
 
+def fa3_triton(q, k, v, causal, softmax_scale, spec):
+    qb = _merge_bh(q).contiguous()
+    kb = _merge_bh(k).contiguous()
+    vb = _merge_bh(v).contiguous()
 
-class FlashAttentionFn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, q, k, v, causal, dropout_p, softmax_scale, softcap):
-        output, aux = flash_fwd(
-            q, k, v,
-            causal=causal,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            softcap=softcap,
-        )
-        ctx.save_for_backward(q, k, v)
-        ctx.causal = causal
-        ctx.dropout_p = dropout_p
-        ctx.softmax_scale = softmax_scale
-        ctx.softcap = softcap
-        ctx.aux = aux
-        return output
+    bh, n, d = qb.shape
+    o = torch.empty_like(qb)
+    lse = torch.empty((bh, n), device=q.device, dtype=torch.float32)
 
-    @staticmethod
-    def backward(ctx, doutput):
-        q, k, v = ctx.saved_tensors
-        dq, dk, dv = flash_bwd(
-            q, k, v, doutput,
-            causal=ctx.causal,
-            dropout_p=ctx.dropout_p,
-            softmax_scale=ctx.softmax_scale,
-            softcap=ctx.softcap,
-        )
-        return dq, dk, dv, None, None, None, None
-
-
-def flashattention3(q, k, v, causal=False, attn_mask=None, dropout_p=0.0, training=False, softmax_scale=None, softcap=0.0):
-    if attn_mask is not None:
-        raise NotImplementedError("attn_mask is not supported in FlashAttention-3 Triton kernel.")
-    if not training and dropout_p > 0.0:
-        dropout_p = 0.0
-    output = FlashAttentionFn.apply(q, k, v, causal, dropout_p, softmax_scale, softcap)
-    return output
+    grid = (bh, triton.cdiv(n, spec.br))
+    fa3_fwd_kernel[grid](
+        qb, kb, vb, o, lse,
+        qb.stride(1), qb.stride(2),
+        kb.stride(1), kb.stride(2),
+        vb.stride(1), vb.stride(2),
+        o.stride(1), o.stride(2),
+        lse.stride(1),
+        n_ctx=n, softmax_scale=softmax_scale,
+        d_head=d, BR=spec.br, BC=spec.bc,
+        CAUSAL=causal, num_warps=spec.num_warps
+    )
+    return o, lse

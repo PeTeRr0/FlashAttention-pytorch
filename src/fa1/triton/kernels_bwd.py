@@ -4,8 +4,10 @@ import triton.language as tl
 @triton.jit
 def fa1_bwd_d_kernel(
     O, DO, D,
-    stride_om, stride_od, stride_dom, stride_dod, stride_dm,
-    n_ctx, d_head: tl.constexpr, BR: tl.constexpr
+    stride_om, stride_od,
+    stride_dom, stride_dod,
+    stride_dm, n_ctx,
+    d_head: tl.constexpr, BR: tl.constexpr
 ):
     pid_bh = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -45,15 +47,14 @@ def fa1_bwd_dk_dv_kernel(
 
     k_ptr = K + pid_bh * stride_km * n_ctx + n_offsets[:, None] * stride_km + d_offsets[None, :] * stride_kd
     v_ptr = V + pid_bh * stride_vm * n_ctx + n_offsets[:, None] * stride_vm + d_offsets[None, :] * stride_vd
-
     k = tl.load(k_ptr, mask=(n_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head), other=0.0).to(tl.float32)
     v = tl.load(v_ptr, mask=(n_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head), other=0.0).to(tl.float32)
 
     dk = tl.zeros((BC, d_head), dtype=tl.float32)
     dv = tl.zeros((BC, d_head), dtype=tl.float32)
 
-    for qblk in range(0, tl.cdiv(n_ctx, BR)):
-        row_start = qblk * BR
+    for pid_m in range(0, tl.cdiv(n_ctx, BR)):
+        row_start = pid_m * BR
         if CAUSAL and (col_start >= row_start + BR):
             continue
 
@@ -67,7 +68,6 @@ def fa1_bwd_dk_dv_kernel(
 
         lse_ptr = LSE + pid_bh * stride_lm * n_ctx + m_offsets * stride_lm
         lse = tl.load(lse_ptr, mask=(m_offsets < n_ctx), other=0.0).to(tl.float32)
-
         d_ptrs = D + pid_bh * stride_dm * n_ctx + m_offsets * stride_dm
         dvec = tl.load(d_ptrs, mask=(m_offsets < n_ctx), other=0.0).to(tl.float32)
 
@@ -81,18 +81,16 @@ def fa1_bwd_dk_dv_kernel(
         p = tl.exp(scores - lse[:, None])
 
         dv += tl.dot(tl.trans(p), do)
-
         dp = tl.dot(do, tl.trans(v))
         ds = p * (dp - dvec[:, None])
 
         dq_update = tl.dot(ds, k) * softmax_scale
         dq_ptr = DQ + pid_bh * stride_dqm * n_ctx + m_offsets[:, None] * stride_dqm + d_offsets[None, :] * stride_dqd
-        tl.atomic_add(dq_ptr, dq_update, mask=(m_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))
+        tl.atomic_add(dq_ptr, dq_update.to(tl.float16), mask=(m_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))
 
         dk += tl.dot(tl.trans(ds), q) * softmax_scale
 
     dk_ptr = DK + pid_bh * stride_dkm * n_ctx + n_offsets[:, None] * stride_dkm + d_offsets[None, :] * stride_dkd
     dv_ptr = DV + pid_bh * stride_dvm * n_ctx + n_offsets[:, None] * stride_dvm + d_offsets[None, :] * stride_dvd
-
-    tl.store(dk_ptr, dk, mask=(n_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))
-    tl.store(dv_ptr, dv, mask=(n_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))
+    tl.store(dk_ptr, dk.to(tl.float16), mask=(n_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))
+    tl.store(dv_ptr, dv.to(tl.float16), mask=(n_offsets[:, None] < n_ctx) & (d_offsets[None, :] < d_head))
