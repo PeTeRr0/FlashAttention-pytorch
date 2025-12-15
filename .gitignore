@@ -239,3 +239,6 @@ tensorboard/
 .python-version
 *.env
 pip-wheel-metadata/
+
+.pyproject.toml
+.setup.py
